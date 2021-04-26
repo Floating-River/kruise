@@ -17,9 +17,11 @@ limitations under the License.
 package daemonset
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	"github.com/onsi/gomega"
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +29,7 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	utilpointer "k8s.io/utils/pointer"
+	crmanager "sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
 func Test_maxRevision(t *testing.T) {
@@ -280,5 +283,98 @@ func TestFilterDaemonPodsNodeToUpdate(t *testing.T) {
 		t.Run(tests[i].name, func(t *testing.T) {
 			testFn(&tests[i], t)
 		})
+	}
+}
+
+func TestControlledHistories(t *testing.T) {
+	// start test manager
+	g := gomega.NewGomegaWithT(t)
+	mgr, err := crmanager.New(cfg, crmanager.Options{})
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	c = mgr.GetClient()
+	stopMgr, mgrStopped := StartTestManager(mgr, g)
+	defer func() {
+		close(stopMgr)
+		mgrStopped.Wait()
+	}()
+
+	// create DaemonSet
+	ds1 := newDaemonSet("ds1")
+	err = c.Create(context.TODO(), ds1)
+	if err != nil {
+		t.Fatalf("create ds1 error, %v", err)
+	}
+
+	// define CR
+	crOfDs1 := newControllerRevision(ds1.GetName()+"-x1", ds1.GetNamespace(), ds1.Spec.Template.Labels,
+		[]metav1.OwnerReference{*metav1.NewControllerRef(ds1, controllerKind)})
+	orphanCrInSameNsWithDs1 := newControllerRevision(ds1.GetName()+"-x2", ds1.GetNamespace(), ds1.Spec.Template.Labels, nil)
+	orphanCrNotInSameNsWithDs1 := newControllerRevision(ds1.GetName()+"-x3", ds1.GetNamespace()+"-other", ds1.Spec.Template.Labels, nil)
+
+	cases := []struct {
+		name                      string
+		manager                   *DaemonSetsController
+		historyCRAll              []*apps.ControllerRevision
+		expectControllerRevisions []*apps.ControllerRevision
+	}{
+		{
+			name: "controller revision in the same namespace",
+			manager: func() *DaemonSetsController {
+				manager, _, _, err := newTestController(c, ds1, crOfDs1, orphanCrInSameNsWithDs1)
+				if err != nil {
+					t.Fatalf("error creating DaemonSets controller: %v", err)
+				}
+				return manager
+			}(),
+			historyCRAll:              []*apps.ControllerRevision{crOfDs1, orphanCrInSameNsWithDs1},
+			expectControllerRevisions: []*apps.ControllerRevision{crOfDs1, orphanCrInSameNsWithDs1},
+		},
+		{
+			name: "Skip adopt the controller revision in the other namespaces",
+			manager: func() *DaemonSetsController {
+				manager, _, _, err := newTestController(c, ds1, orphanCrNotInSameNsWithDs1)
+				if err != nil {
+					t.Fatalf("error creating DaemonSets controller: %v", err)
+				}
+				return manager
+			}(),
+			historyCRAll:              []*apps.ControllerRevision{orphanCrNotInSameNsWithDs1},
+			expectControllerRevisions: []*apps.ControllerRevision{},
+		},
+	}
+
+	for _, c := range cases {
+		for _, h := range c.historyCRAll {
+			err := c.manager.historyStore.Add(h)
+			if err != nil {
+				t.Fatalf("add CR to history store error, %v", err)
+			}
+		}
+
+		crList, err := c.manager.controlledHistories(ds1)
+		if err != nil {
+			t.Fatalf("Test case: %s. Unexpected error: %v", c.name, err)
+		}
+
+		if len(crList) != len(c.expectControllerRevisions) {
+			t.Errorf("Test case: %s, expect controllerrevision count %d but got:%d",
+				c.name, len(c.expectControllerRevisions), len(crList))
+		} else {
+			// check controller revisions match
+			for _, cr := range crList {
+				found := false
+				for _, expectCr := range c.expectControllerRevisions {
+					if reflect.DeepEqual(cr, expectCr) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Test case: %s, controllerrevision %v not expected",
+						c.name, cr)
+				}
+			}
+			t.Logf("Test case: %s done", c.name)
+		}
 	}
 }

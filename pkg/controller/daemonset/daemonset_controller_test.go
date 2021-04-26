@@ -208,6 +208,8 @@ type DaemonSetsController struct {
 	setListerSynced cache.InformerSynced
 	// revListerSynced returns true if the rev shared informer has synced at least once
 	revListerSynced cache.InformerSynced
+	// historyStore is the cache of controller revisions
+	historyStore cache.Store
 }
 
 func splitObjects(initialObjects []runtime.Object) ([]runtime.Object, []runtime.Object) {
@@ -270,6 +272,7 @@ func NewDaemonSetController(
 		podListerSynced: podInformer.Informer().HasSynced,
 		setListerSynced: setInformer.Informer().HasSynced,
 		revListerSynced: revInformer.Informer().HasSynced,
+		historyStore:    revInformer.Informer().GetStore(),
 	}
 	return dsc
 }
@@ -541,5 +544,18 @@ func TestCanNodeBeDeployed(t *testing.T) {
 				t.Errorf("CanNodeBeDeployed() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func newControllerRevision(name string, namespace string, label map[string]string,
+	ownerReferences []metav1.OwnerReference) *apps.ControllerRevision {
+	return &apps.ControllerRevision{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Labels:          label,
+			Namespace:       namespace,
+			OwnerReferences: ownerReferences,
+		},
 	}
 }
